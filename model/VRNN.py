@@ -49,7 +49,7 @@ class MLP(nn.Module):
 
 
 class VRNN(nn.Module):
-    def __init__(self, x_dim=80, h_dim=256, z_dim=32, phi_x_dim, phi_z_dim ):
+    def __init__(self, x_dim=80, h_dim=256, z_dim=32, phi_x_dim=32, phi_z_dim=16):
         super().__init__()
         self.x_dim = x_dim
         self.h_dim = h_dim
