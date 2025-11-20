@@ -1,9 +1,5 @@
 import torch
-from torch.utils.data import DataLoader
-from model.vrnn import VRNN
 from torch.nn.utils.rnn import pad_sequence
-
-from dataset import AudioDataset
 
 
 def collate_fn(batch):
@@ -12,8 +8,28 @@ def collate_fn(batch):
     padded = pad_sequence(batch, batch_first=False)  # (seq_len_max, batch, feat)
     return padded
 
-def train(model, dataloader, epochs=30, lr=1e-3, kl_anneal_epochs=10):
+
+def evaluate(model, dataloader, device='cpu'):
+    model.eval()
+    total_recon = 0
+    total_kld = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(device)
+            batch_size = batch.size(1)
+            recon, kld = model(batch)
+            recon = recon / batch_size
+            kld = kld / batch_size
+            total_recon += recon.item()
+            total_kld += kld.item()
+    return total_recon, total_kld
+
+
+def train(model, dataloader, val_loader, epochs=30, lr=1e-3, kl_anneal_epochs=10, device='cpu'):
     optim = torch.optim.Adam(model.parameters(), lr=lr)
+
+    train_losses = []
+    val_losses = []
 
     for epoch in range(epochs):
         total_recon = 0
@@ -22,7 +38,7 @@ def train(model, dataloader, epochs=30, lr=1e-3, kl_anneal_epochs=10):
         beta = min(1.0, epoch / kl_anneal_epochs)
 
         for batch in dataloader:
-            batch = batch.to(device) #batch.permute(1, 0, 2).to(device)   # (seq, batch, feat)
+            batch = batch.to(device)#batch.permute(1, 0, 2).to(device)   # (seq, batch, feat)
             batch_size = batch.size(1)
 
             optim.zero_grad()
@@ -38,15 +54,11 @@ def train(model, dataloader, epochs=30, lr=1e-3, kl_anneal_epochs=10):
             total_recon += recon.item()
             total_kld += kld.item()
 
-        print(f"[{epoch+1}] Recon: {total_recon:.3f} | KL: {total_kld:.3f} | β={beta:.2f}")
+            total_recon_val, total_kld_val = evaluate(model, val_loader)
+    
+            train_losses.append(total_recon + beta * total_kld)
+            val_losses.append(total_recon_val + beta * total_kld_val)
+
+        print(f"[{epoch+1}] Train: {train_losses[-1]:.3f} | Val: {val_losses[-1]:.3f} | β={beta:.2f}")
 
         torch.save(model.state_dict(), f"vrnn_epoch{epoch+1}.pt")
-        
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = VRNN().to(device)
-
-    dataset = AudioDataset("data_flac/")
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-
-    train(model, dataloader)
