@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 def get_activation(name):
     if name is None:
@@ -59,14 +59,14 @@ class VRNN(nn.Module):
 
         self.phi_x = MLP(
             input_dim=x_dim,
-            n_list=[256, phi_x_dim ],
+            n_list=[256, phi_x_dim],
             f_list=["tanh", "linear"]
         )
 
         self.phi_z = MLP(
-        input_dim=z_dim,
-        n_list=[32, 64, phi_z_dim ],
-        f_list=["tanh", "tanh", "linear"]
+            input_dim=z_dim,
+            n_list=[32, 64, phi_z_dim],
+            f_list=["tanh", "tanh", "linear"]
         )
 
         # Encoder q(z|x,h)
@@ -97,7 +97,7 @@ class VRNN(nn.Module):
         self.dec_logvar = nn.Linear(256, x_dim)
 
         # RNN
-        self.rnn = nn.GRU(phi_x_dim  + phi_z_dim , h_dim)
+        self.rnn = nn.GRU(phi_x_dim + phi_z_dim, h_dim)
 
     def forward(self, x):
         """
