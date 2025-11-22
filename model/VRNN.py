@@ -56,7 +56,6 @@ class VRNN(nn.Module):
         self.z_dim = z_dim
 
         # Features extractors phi
-
         self.phi_x = MLP(
             input_dim=x_dim,
             n_list=[256, phi_x_dim],

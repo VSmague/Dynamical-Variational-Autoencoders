@@ -22,8 +22,8 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
 def evaluate(model, dataloader, device):
     model.eval()
     total_recon, total_kld = 0, 0
-    n_batches = 0
-   
+    n_batches = len(dataloader)
+
     with torch.no_grad():
         for batch in dataloader:
             batch = batch.to(device)              # (batch, seq, feat)
@@ -36,7 +36,6 @@ def evaluate(model, dataloader, device):
 
             total_recon += recon.item()
             total_kld += kld.item()
-            n_batches += 1
 
     return total_recon / n_batches, total_kld / n_batches
 
@@ -54,7 +53,6 @@ def train(
     patience=7,
     device="cuda"
 ):
-
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -76,10 +74,10 @@ def train(
         print(f"Resuming from epoch {start_epoch}")
 
     # Training loop
+    n_batches = len(train_loader)
     for epoch in range(start_epoch, epochs):
         model.train()
         total_recon, total_kld = 0, 0
-        n_batches = 0
 
         beta = min(1.0, epoch / kl_anneal_epochs)
 
@@ -101,7 +99,6 @@ def train(
 
             total_recon += recon.item()
             total_kld += kld.item()
-            n_batches += 1
 
         train_recon = total_recon / n_batches
         train_kld = total_kld / n_batches
