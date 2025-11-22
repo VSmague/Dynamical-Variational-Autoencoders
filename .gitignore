@@ -1,7 +1,4 @@
-data/mels_saved/**
-experiments/checkpoints/**
-
-*/*/*.pt
-*/*/*.pth
+data/
+experiments/checkpoints/
 
 **/__pycache__/
