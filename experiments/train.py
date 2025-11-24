@@ -1,6 +1,10 @@
 import os
 import json
+from typing import Optional
+
 import torch
+from torch import Tensor
+from model.VRNN import VRNN
 
 
 def save_checkpoint(state, checkpoint_dir, name="last.pt"):
@@ -19,9 +23,35 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     return start_epoch, history
 
 
-def evaluate(model, dataloader, device):
+def load_model(checkpoint_path, device):
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model = VRNN()
+    model.load_state_dict(ckpt["model_state"])
+    model.to(device)
     model.eval()
-    total_recon, total_kld = 0, 0
+    return model
+
+
+def isd_loss(x: Tensor, y: Tensor):
+    y = y + torch.finfo(y.dtype).eps
+    div = x / y
+    return torch.sum(div - torch.log(div) - 1)
+
+
+def kld_loss(z_mean: Tensor, z_logvar: Tensor, z_mean_p: Optional[Tensor]=None, z_logvar_p: Optional[Tensor]=None):
+    if z_mean_p is None:
+        z_mean_p = torch.zeros_like(z_mean)
+    if z_logvar_p is None:
+        z_logvar_p = torch.zeros_like(z_logvar)
+
+    return -0.5 * torch.sum(z_logvar - z_logvar_p
+                            - torch.div(torch.exp(z_logvar) + (z_mean - z_mean_p) ** 2,
+                                        torch.exp(z_logvar_p) + torch.finfo(z_logvar.dtype).eps))
+
+
+def evaluate(model: VRNN, dataloader, device):
+    model.eval()
+    total_recon, total_kl = 0, 0
     n_batches = len(dataloader)
 
     with torch.no_grad():
@@ -30,18 +60,20 @@ def evaluate(model, dataloader, device):
             batch = batch.permute(1, 0, 2)        # → (seq, batch, feat)
             seq_len, batch_size, _ = batch.shape
 
-            recon, kld = model(batch)
-            recon = recon / (batch_size * seq_len)
-            kld = kld / (batch_size * seq_len)
+            recon = torch.exp(model(batch))
+            recon_loss = isd_loss(batch, recon)
+            kl_loss = kld_loss(model.z_mean, model.z_logvar, model.z_mean_p, model.z_logvar_p)
+            recon_loss = recon_loss / (batch_size * seq_len)
+            kl_loss = kl_loss / (batch_size * seq_len)
 
-            total_recon += recon.item()
-            total_kld += kld.item()
+            total_recon += recon_loss.item()
+            total_kl += kl_loss.item()
 
-    return total_recon / n_batches, total_kld / n_batches
+    return total_recon / n_batches, total_kl / n_batches
 
 
 def train(
-    model,
+    model: VRNN,
     train_loader,
     val_loader,
     checkpoint_dir="checkpoints",
@@ -51,16 +83,22 @@ def train(
     lr=1e-4,
     kl_anneal_epochs=10,
     patience=7,
+    save_frequency=5,
     device="cuda"
 ):
+    torch.autograd.set_detect_anomaly(True)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # Tracking
     history = {
         "train": [],
+        "train_recon": [],
+        "train_kl": [],
         "val": [],
-        "beta": []
+        "val_recon": [],
+        "val_kl": [],
+        "beta": [],
     }
 
     start_epoch = 0
@@ -77,8 +115,7 @@ def train(
     n_batches = len(train_loader)
     for epoch in range(start_epoch, epochs):
         model.train()
-        total_recon, total_kld = 0, 0
-
+        total_recon, total_kl = 0, 0
         beta = min(1.0, epoch / kl_anneal_epochs)
 
         for batch in train_loader:
@@ -87,42 +124,51 @@ def train(
             seq_len, batch_size, _ = batch.shape
 
             optimizer.zero_grad()
-            recon, kld = model(batch)
+            recon = torch.exp(model(batch))
+            recon_loss = isd_loss(batch, recon)
+            mean, logvar = model(batch)
+            kl_loss = kld_loss(model.z_mean, model.z_logvar, model.z_mean_p, model.z_logvar_p)
 
-            recon = recon / (batch_size * seq_len)
-            kld = kld / (batch_size * seq_len)
-            loss = recon + beta * kld
+            recon_loss = recon_loss / (batch_size * seq_len)
+            kl_loss = kl_loss / (batch_size * seq_len)
+            loss = recon_loss + beta * kl_loss
 
+            optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            total_recon += recon.item()
-            total_kld += kld.item()
+            total_recon += recon_loss.item()
+            total_kl += kl_loss.item()
 
         train_recon = total_recon / n_batches
-        train_kld = total_kld / n_batches
-        train_loss = train_recon + beta * train_kld
+        train_kl = total_kl / n_batches
+        train_loss = train_recon + beta * train_kl
 
         # Validation
-        val_recon, val_kld = evaluate(model, val_loader, device=device)
-        val_loss = val_recon + beta * val_kld
+        val_recon, val_kl = evaluate(model, val_loader, device=device)
+        val_loss = val_recon + beta * val_kl
 
         print(f"[{epoch+1}/{epochs}] "
               f"Train: {train_loss:.3f} | Val: {val_loss:.3f} | β={beta:.3f}")
 
         # Update history
         history["train"].append(train_loss)
+        history["train_recon"].append(train_recon)
+        history["train_kl"].append(train_kl)
         history["val"].append(val_loss)
+        history["val_recon"].append(val_recon)
+        history["val_kl"].append(val_kl)
         history["beta"].append(beta)
 
         # Save last checkpoint
-        save_checkpoint({
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "history": history
-        }, checkpoint_dir, "last.pt")
+        if epoch % save_frequency == 0:
+            save_checkpoint({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "history": history
+            }, checkpoint_dir, "last.pt")
 
         # Save best model
         if val_loss < best_val_loss - 1e-4:
