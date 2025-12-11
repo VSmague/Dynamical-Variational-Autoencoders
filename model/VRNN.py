@@ -54,7 +54,7 @@ class MLP(nn.Module):
 
 
 class VRNN(nn.Module):
-    def __init__(self, x_dim=80, h_dim=256, z_dim=32, phi_x_dim=32, phi_z_dim=16, dropout=0.0):
+    def __init__(self, x_dim=513, h_dim=256, z_dim=32, phi_x_dim=32, phi_z_dim=16, dropout=0.0):
         super().__init__()
         self.x_dim = x_dim # 513
         self.h_dim = h_dim # 128
@@ -107,12 +107,12 @@ class VRNN(nn.Module):
         self.dec_logvar = nn.Linear(256, x_dim)
 
         # RNN
-        self.rnn = nn.LSTM(phi_x_dim + phi_z_dim, h_dim, num_layers=1)
+        self.rnn = nn.LSTM(phi_x_dim + phi_z_dim, h_dim, num_layers=1, batch_first=True)
 
         self.z_mean = torch.zeros((1, 1, self.z_dim))
         self.z_logvar = torch.zeros((1, 1, self.z_dim))
-        self.z_mean_p = None
-        self.z_logvar_p = None
+        self.z_mean_prior = None
+        self.z_logvar_prior = None
 
 
     def sample_norm(self, mean, logvar):
@@ -172,7 +172,7 @@ class VRNN(nn.Module):
             z_t = self.sample_norm(mean_zt, logvar_zt)
             phi_zt = self.phi_z(z_t)
 
-            y_t_mean, y_t_logvar = self.gen_x(phi_zt, h_t_last)
+            y_t_logvar = self.gen_x(phi_zt, h_t_last)
 
             self.z_mean[t, :, :] = mean_zt
             self.z_logvar[t, :, :] = logvar_zt
@@ -182,7 +182,7 @@ class VRNN(nn.Module):
             h[t, :, :] = torch.squeeze(h_t_last)
             h_t, c_t = self.recurrence(phi_xt, phi_zt, h_t, c_t) # recurrence for t+1
 
-        self.z_mean_p, self.z_logvar_p = self.gen_z(h)
+        self.z_mean_prior, self.z_logvar_prior = self.gen_z(h)
         return y_logvar
 
 
@@ -234,7 +234,7 @@ class VRNN(nn.Module):
                 - 1
             )
 
-            # --------- RNN update : input = φ_x(x_t) + φ_z(z_t)
+            # RNN update : input = φ_x(x_t) + φ_z(z_t)
             rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
             _, h = self.rnn(rnn_input, h)
 

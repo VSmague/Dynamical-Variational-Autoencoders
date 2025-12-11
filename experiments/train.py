@@ -33,23 +33,25 @@ def load_model(checkpoint_path, device):
 
 
 def isd_loss(x: Tensor, y: Tensor):
-    y = y + torch.finfo(y.dtype).eps
+    eps = 1e-8
+    y = y + eps
+    x = x + eps
     div = x / y
     return torch.sum(div - torch.log(div) - 1)
 
 
-def kld_loss(z_mean: Tensor, z_logvar: Tensor, z_mean_p: Optional[Tensor]=None, z_logvar_p: Optional[Tensor]=None):
-    if z_mean_p is None:
-        z_mean_p = torch.zeros_like(z_mean)
-    if z_logvar_p is None:
-        z_logvar_p = torch.zeros_like(z_logvar)
+def kld_loss(z_mean: Tensor, z_logvar: Tensor, z_mean_prior: Optional[Tensor]=None, z_logvar_prior: Optional[Tensor]=None):
+    if z_mean_prior is None:
+        z_mean_prior = torch.zeros_like(z_mean)
+    if z_logvar_prior is None:
+        z_logvar_prior = torch.zeros_like(z_logvar)
 
-    return -0.5 * torch.sum(z_logvar - z_logvar_p
-                            - torch.div(torch.exp(z_logvar) + (z_mean - z_mean_p) ** 2,
-                                        torch.exp(z_logvar_p) + torch.finfo(z_logvar.dtype).eps))
+    return -0.5 * torch.sum(z_logvar - z_logvar_prior
+                            - torch.div(torch.exp(z_logvar) + (z_mean - z_mean_prior) ** 2,
+                                        torch.exp(z_logvar_prior) + torch.finfo(z_logvar.dtype).eps))
 
 
-def evaluate(model: VRNN, dataloader, device):
+def evaluate(model, dataloader, device):
     model.eval()
     total_recon, total_kl = 0, 0
     n_batches = len(dataloader)
@@ -62,7 +64,7 @@ def evaluate(model: VRNN, dataloader, device):
 
             recon = torch.exp(model(batch))
             recon_loss = isd_loss(batch, recon)
-            kl_loss = kld_loss(model.z_mean, model.z_logvar, model.z_mean_p, model.z_logvar_p)
+            kl_loss = kld_loss(model.z_mean, model.z_logvar, model.z_mean_prior, model.z_logvar_prior)
             recon_loss = recon_loss / (batch_size * seq_len)
             kl_loss = kl_loss / (batch_size * seq_len)
 
@@ -73,17 +75,16 @@ def evaluate(model: VRNN, dataloader, device):
 
 
 def train(
-    model: VRNN,
+    model,
     train_loader,
     val_loader,
     checkpoint_dir="checkpoints",
     resume=False,
     epochs=50,
-    batch_size=32,
     lr=1e-4,
     kl_anneal_epochs=10,
     patience=7,
-    save_frequency=5,
+    save_frequency=10,
     device="cuda"
 ):
     torch.autograd.set_detect_anomaly(True)
@@ -126,8 +127,7 @@ def train(
             optimizer.zero_grad()
             recon = torch.exp(model(batch))
             recon_loss = isd_loss(batch, recon)
-            mean, logvar = model(batch)
-            kl_loss = kld_loss(model.z_mean, model.z_logvar, model.z_mean_p, model.z_logvar_p)
+            kl_loss = kld_loss(model.z_mean, model.z_logvar, model.z_mean_prior, model.z_logvar_prior)
 
             recon_loss = recon_loss / (batch_size * seq_len)
             kl_loss = kl_loss / (batch_size * seq_len)
