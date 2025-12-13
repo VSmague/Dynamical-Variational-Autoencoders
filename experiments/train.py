@@ -62,7 +62,11 @@ def train(
     history = {
         "train": [],
         "val": [],
-        "beta": []
+        "beta": [],
+        "train_recon": [],
+        "train_kld": [],
+        "val_recon": [],
+        "val_kld": []
     }
 
     start_epoch = 0
@@ -118,6 +122,10 @@ def train(
         history["train"].append(train_loss)
         history["val"].append(val_loss)
         history["beta"].append(beta)
+        history["train_recon"].append(train_recon)
+        history["train_kld"].append(train_kld)
+        history["val_recon"].append(val_recon)
+        history["val_kld"].append(val_kld)
 
         # Save last checkpoint
         save_checkpoint({

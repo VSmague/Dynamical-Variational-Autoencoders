@@ -152,3 +152,44 @@ class VRNN(nn.Module):
             _, h = self.rnn(rnn_input, h)
 
         return recon_loss, kld_loss
+
+
+    @torch.no_grad()
+    def generate(self, seq_len, batch=1, device="cpu", deterministic=False):
+        h = torch.zeros(1, batch, self.h_dim, device=device)
+
+        x_samples = []
+
+        for t in range(seq_len):
+            # Prior p(z|h)
+            prior_h = self.prior(h.squeeze(0))
+            prior_mu = self.prior_mu(prior_h)
+            prior_logvar = self.prior_logvar(prior_h)
+
+            if deterministic:
+                z_t = prior_mu
+            else:
+                std = torch.exp(0.5 * prior_logvar)
+                z_t = prior_mu + torch.randn_like(std) * std
+
+            phi_z_t = self.phi_z(z_t)
+
+            # Decoder p(x|z,h)
+            dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
+            dec_mu = self.dec_mu(dec_h)
+            dec_logvar = self.dec_logvar(dec_h)
+
+            if deterministic:
+                x_t = dec_mu
+            else:
+                std_x = torch.exp(0.5 * dec_logvar)
+                x_t = dec_mu + torch.randn_like(std_x) * std_x
+
+            x_samples.append(x_t)
+
+            # RNN update
+            phi_x_t = self.phi_x(x_t)
+            rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+            _, h = self.rnn(rnn_input, h)
+
+        return torch.stack(x_samples)  # (seq_len, batch, x_dim)
