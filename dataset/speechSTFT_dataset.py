@@ -69,7 +69,7 @@ def get_wav_paths(data_dir):
 # Exemple d'utilisation
 # -----------------------------
 if __name__ == "__main__":
-    data_dir = "path_to_your_wav_dataset"  # changer avec le chemin de ton dataset
+    data_dir = "data/data_wav"  # changer avec le chemin de ton dataset
     wav_paths = get_wav_paths(data_dir)
 
     # Créer dataset et dataloader
@@ -79,6 +79,7 @@ if __name__ == "__main__":
     dataset = SpeechSTFTDataset(wav_paths, seq_len=seq_len)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    print(len(dataloader), "batches dans le dataloader.")
     # Tester une batch
     for batch in dataloader:
         # batch.shape -> (batch_size, seq_len, 513)
