@@ -153,7 +153,6 @@ class VRNN(nn.Module):
 
         return recon_loss, kld_loss
 
-
     @torch.no_grad()
     def generate(self, seq_len, batch=1, device="cpu", deterministic=False):
         h = torch.zeros(1, batch, self.h_dim, device=device)
@@ -193,3 +192,39 @@ class VRNN(nn.Module):
             _, h = self.rnn(rnn_input, h)
 
         return torch.stack(x_samples)  # (seq_len, batch, x_dim)
+
+    @torch.no_grad()
+    def reconstruct(self, x):
+        """
+        Reconstruit un input x sans sampling stochastique.
+        x : (seq_len, batch, x_dim)
+        return : x_hat : (seq_len, batch, x_dim)
+        """
+        seq_len, batch, _ = x.size()
+        h = torch.zeros(1, batch, self.h_dim, device=x.device)
+        x_hat_list = []
+
+        for t in range(seq_len):
+            x_t = x[t]  # [batch, x_dim]
+
+            # φ_x(x_t)
+            phi_x_t = self.phi_x(x_t)
+
+            # Encoder q(z|x,h)
+            enc_h = self.enc(torch.cat([phi_x_t, h.squeeze(0)], dim=1))
+            enc_mu = self.enc_mu(enc_h)
+            # On prend z = μ pour reconstruction
+            phi_z_t = self.phi_z(enc_mu)
+
+            # Decoder p(x|z,h)
+            dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
+            dec_mu = self.dec_mu(dec_h)
+
+            x_hat_list.append(dec_mu)
+
+            # Mise à jour RNN
+            rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+            _, h = self.rnn(rnn_input, h)
+
+        x_hat = torch.stack(x_hat_list)  # [seq_len, batch, x_dim]
+        return x_hat
