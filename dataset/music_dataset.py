@@ -156,7 +156,7 @@ class MusicDataset(Dataset):
 
 
 if __name__ == "__main__":
-    dataset_root = "data/nsynth/nsynth-valid"  # Change to your NSynth dataset path
+    dataset_root = "data/nsynth/nsynth-test"  # Change to your NSynth dataset path
     families= ["bass", "brass", "flute", "guitar", "keyboard", "mallet", 
         "organ", "reed", "string", "synth_lead", "vocal"]
     for fam in families:
@@ -166,13 +166,15 @@ if __name__ == "__main__":
     paths = get_nsynth_paths(dataset_root, instrument_family)
     print(f"All samples: {len(paths)} samples")
 
-    wav_paths = get_nsynth_paths(dataset_root, "guitar")
+    instrument_family = "guitar"
+    wav_paths = get_nsynth_paths(dataset_root, instrument_family=instrument_family)
     seq_len = 50
     batch_size = 16
     dataset = MusicDataset(wav_paths, seq_len=seq_len)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Test a batch
+    print(f"For {instrument_family} instrument:")
     print(len(dataloader), "batches in the dataloader.")
     for batch in dataloader:
         # batch.shape -> (batch_size, seq_len, 513)
