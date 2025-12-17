@@ -99,29 +99,47 @@ class VRNN(nn.Module):
         # RNN
         self.rnn = nn.GRU(phi_x_dim + phi_z_dim, h_dim)
 
-    def forward(self, x):
+
+    def forward(self, x, teacher_forcing_ratio=1.0):
         """
         x : (seq_len, batch, x_dim)
+        teacher_forcing_ratio : probabilité d'utiliser la vraie donnée (Ground Truth)
         """
         seq_len, batch, _ = x.size()
         h = torch.zeros(1, batch, self.h_dim, device=x.device)
 
         kld_loss = 0
         recon_loss = 0
-        # LISTE POUR STOCKER L'AUDIO RECONSTRUIT
+        
         all_recon = []
+        
+        # Pour le premier pas de temps, on est obligé d'utiliser la vraie donnée ou des zéros
+        # Ici on suppose qu'on utilise x[0] pour démarrer proprement
+        prev_x = x[0] 
 
         for t in range(seq_len):
-            x_t = x[t]
-            phi_x_t = self.phi_x(x_t)
+            # --- SELECTION DE L'ENTRÉE (SCHEDULED SAMPLING) ---
+            if t == 0:
+                x_t_input = x[t]
+            else:
+                # avec probabilité fixée par le teacher_forcing_ratio, on décide si on utilise la prédiction précédente ou les vraies données 
+                if torch.rand(1).item() < teacher_forcing_ratio:
+                    x_t_input = x[t]      # Teacher Forcing
+                else:
+                    x_t_input = prev_x    # Auto-régressif (modèle utilise sa propre sortie)
+
+            # --------------------------------------------------
+            # Le reste est identique, mais on utilise x_t_input pour l'extraction de features
+            phi_x_t = self.phi_x(x_t_input)
 
             # Prior
             prior_h = self.prior(h.squeeze(0))
             prior_mu = self.prior_mu(prior_h)
             prior_logvar = self.prior_logvar(prior_h)
 
-            # Encoder q(z|x,h)
-            enc_h = self.enc(torch.cat([phi_x_t, h.squeeze(0)], dim=1))
+            # Encoder 
+            enc_h = self.enc(torch.cat([phi_x_t, h.squeeze(0)], dim=1)) 
+            
             enc_mu = self.enc_mu(enc_h)
             enc_logvar = self.enc_logvar(enc_h)
 
@@ -135,29 +153,90 @@ class VRNN(nn.Module):
             dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
             dec_mu = self.dec_mu(dec_h)
             dec_logvar = self.dec_logvar(dec_h)
-
-            #reconstruction x du modèle
+            
             all_recon.append(dec_mu)
-            x_recon = torch.stack(all_recon)
+            
+            # --- STOCKAGE POUR LE PROCHAIN TOUR ---
+            prev_x = dec_mu # C'est ce qui sera utilisé au prochain tour si teacher_forcing_ratio échoue
 
-            # Loss
+            # Loss (On compare toujours à la VRAIE cible x[t])
             recon_loss += 0.5 * torch.sum(
                 dec_logvar
-                + (x_t - dec_mu)**2 / torch.exp(dec_logvar)
+                + (x[t] - dec_mu)**2 / torch.exp(dec_logvar)
             )
 
-            # KL divergence KL(q(z|x,h) || p(z|h))
             kld_loss += 0.5 * torch.sum(
                 prior_logvar - enc_logvar
                 + (torch.exp(enc_logvar) + (enc_mu - prior_mu)**2) / torch.exp(prior_logvar)
                 - 1
             )
 
-            # --------- RNN update : input = φ_x(x_t) + φ_z(z_t)
+            # Update RNN
             rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
             _, h = self.rnn(rnn_input, h)
 
+        x_recon = torch.stack(all_recon)
         return x_recon, recon_loss, kld_loss
+
+    # def forward(self, x):
+    #     """
+    #     x : (seq_len, batch, x_dim)
+    #     """
+    #     seq_len, batch, _ = x.size()
+    #     h = torch.zeros(1, batch, self.h_dim, device=x.device)
+
+    #     kld_loss = 0
+    #     recon_loss = 0
+    #     # LISTE POUR STOCKER L'AUDIO RECONSTRUIT
+    #     all_recon = []
+
+    #     for t in range(seq_len):
+    #         x_t = x[t]
+    #         phi_x_t = self.phi_x(x_t)
+
+    #         # Prior
+    #         prior_h = self.prior(h.squeeze(0))
+    #         prior_mu = self.prior_mu(prior_h)
+    #         prior_logvar = self.prior_logvar(prior_h)
+
+    #         # Encoder q(z|x,h)
+    #         enc_h = self.enc(torch.cat([phi_x_t, h.squeeze(0)], dim=1))
+    #         enc_mu = self.enc_mu(enc_h)
+    #         enc_logvar = self.enc_logvar(enc_h)
+
+    #         # Sampling z
+    #         std = torch.exp(0.5 * enc_logvar)
+    #         eps = torch.randn_like(std)
+    #         z_t = enc_mu + eps * std
+    #         phi_z_t = self.phi_z(z_t)
+
+    #         # Decoder
+    #         dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
+    #         dec_mu = self.dec_mu(dec_h)
+    #         dec_logvar = self.dec_logvar(dec_h)
+
+    #         #reconstruction x du modèle
+    #         all_recon.append(dec_mu)
+    #         x_recon = torch.stack(all_recon)
+
+    #         # Loss
+    #         recon_loss += 0.5 * torch.sum(
+    #             dec_logvar
+    #             + (x_t - dec_mu)**2 / torch.exp(dec_logvar)
+    #         )
+
+    #         # KL divergence KL(q(z|x,h) || p(z|h))
+    #         kld_loss += 0.5 * torch.sum(
+    #             prior_logvar - enc_logvar
+    #             + (torch.exp(enc_logvar) + (enc_mu - prior_mu)**2) / torch.exp(prior_logvar)
+    #             - 1
+    #         )
+
+    #         # --------- RNN update : input = φ_x(x_t) + φ_z(z_t)
+    #         rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+    #         _, h = self.rnn(rnn_input, h)
+
+    #     return x_recon, recon_loss, kld_loss
 
 
 
