@@ -27,6 +27,165 @@ from utils.padding import collate_fn
 
 
 
+#### modifications ajout scheduler learning rate
+
+# MODIFICATION  : Ajout de l'argument 'scheduler' pour recharger son état
+def load_checkpoint_s(model, optimizer, scheduler, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state"])
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    
+    # On charge l'état du scheduler s'il existe dans la sauvegarde
+    if "scheduler_state" in checkpoint and scheduler is not None:
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        
+    start_epoch = checkpoint["epoch"] + 1
+    history = checkpoint["history"]
+    print(f"Checkpoint loaded from: {checkpoint_path}")
+    return start_epoch, history
+
+def train_model_with_scheduler(
+    model,
+    train_loader,
+    val_loader,
+    checkpoint_dir="checkpoints",
+    resume=False,
+    epochs=50,
+    batch_size=32,
+    lr=1e-4,
+    kl_anneal_epochs=10,
+    patience=20, 
+    device="cuda"
+):
+
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # MODIFICATION 2 : Initialisation du Scheduler
+    # factor=0.5 : Divise le learning rate par 2 quand ça stagne
+    # patience=5 : Attend 5 epochs de stagnation avant d'agir
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    # Tracking
+    history = {
+        "train": [], "val": [], "beta": [],
+        "train_recon": [], "train_kld": [],
+        "val_recon": [], "val_kld": [],
+        "lr": [] # MODIFICATION : On garde une trace du Learning Rate
+    }
+
+    start_epoch = 0
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    # Resume training
+    last_ckpt = os.path.join(checkpoint_dir, "last.pt")
+    if resume and os.path.exists(last_ckpt):
+        # MODIFICATION : On passe le scheduler à la fonction de chargement
+        start_epoch, history = load_checkpoint_s(model, optimizer, scheduler, last_ckpt, device)
+        print(f"Resuming from epoch {start_epoch}")
+
+    # Training loop
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        total_recon, total_kld = 0, 0
+        n_batches = 0
+
+        # Calcul de Beta (KL Annealing)
+        beta = min(1.0, epoch / kl_anneal_epochs) if kl_anneal_epochs > 0 else 1.0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} Training"):
+            batch = batch.to(device)             
+            batch = batch.permute(1, 0, 2)       
+            seq_len, batch_size, _ = batch.shape
+
+            optimizer.zero_grad()
+            _,recon, kld = model(batch)
+
+            recon = recon / (batch_size * seq_len)
+            kld = kld / (batch_size * seq_len)
+            loss = recon + beta * kld
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_recon += recon.item()
+            total_kld += kld.item()
+            n_batches += 1
+
+        train_recon = total_recon / n_batches
+        train_kld = total_kld / n_batches
+        train_loss = train_recon + beta * train_kld
+
+        # Validation
+        val_recon, val_kld = evaluate(model, val_loader, device=device)
+        val_loss = val_recon + beta * val_kld
+
+        # MODIFICATION 3 : Step du Scheduler
+        # On informe le scheduler de la nouvelle validation loss
+        scheduler.step(val_loss)
+        
+        # Récupération du LR actuel pour l'affichage
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"[{epoch+1}/{epochs}] "
+              f"Train: {train_loss:.3f} | Val: {val_loss:.3f} | "
+              f"β={beta:.3f} | LR={current_lr:.2e}")
+
+        # Update history
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        history["beta"].append(beta)
+        history["train_recon"].append(train_recon)
+        history["train_kld"].append(train_kld)
+        history["val_recon"].append(val_recon)
+        history["val_kld"].append(val_kld)
+        history["lr"].append(current_lr) # On loggue le LR
+
+        # Save Checkpoint Dict (Helper)
+        # MODIFICATION 4 : On ajoute l'état du scheduler dans la sauvegarde
+        checkpoint_dict = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(), # <--- ICI
+            "history": history
+        }
+
+        # Save last checkpoint
+        save_checkpoint(checkpoint_dict, checkpoint_dir, "last.pt")
+
+        # Save best model
+        if val_loss < best_val_loss - 1e-4:
+            best_val_loss = val_loss
+            save_checkpoint(checkpoint_dict, checkpoint_dir, "best.pt")
+            patience_counter = 0
+            print(" → Saved BEST model")
+        else:
+            patience_counter += 1
+
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {patience} epochs without improvement.")
+            break
+
+    # Save history as JSON
+    with open(os.path.join(checkpoint_dir, "history.json"), "w") as f:
+        # Helper pour rendre les float32 sérialisables en JSON si besoin
+        class FloatEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, torch.Tensor): return obj.item()
+                return json.JSONEncoder.default(self, obj)
+        json.dump(history, f, indent=4, cls=FloatEncoder)
+
+    print("\nTraining complete.")
+    return history
+
+
+
 
 
 
@@ -54,6 +213,8 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     return start_epoch, history
 
 
+
+
 def evaluate(model, dataloader, device):
     model.eval()
     total_recon, total_kld = 0, 0
@@ -74,7 +235,6 @@ def evaluate(model, dataloader, device):
             n_batches += 1
 
     return total_recon / n_batches, total_kld / n_batches
-
 
 
 def train_model(
@@ -201,6 +361,173 @@ def train_model(
 
 
 
+def evaluate_scheduled_sampling(model, dataloader, device, teacher_forcing_ratio=1.0):
+    """
+    teacher_forcing_ratio : 
+       - 1.0 (Défaut) = Le modèle reçoit la vraie réponse précédente (Test de Reconstruction).
+       - 0.0 = Le modèle utilise sa propre prédiction précédente (Test de Génération/Autonomie).
+    """
+    model.eval()
+    total_recon, total_kld = 0, 0
+    n_batches = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(device)              # (batch, seq, feat)
+            batch = batch.permute(1, 0, 2)        # → (seq, batch, feat)
+            seq_len, batch_size, _ = batch.shape
+
+            # --- MODIFICATION ICI : On passe le ratio au modèle ---
+            _, recon, kld = model(batch, teacher_forcing_ratio=teacher_forcing_ratio)
+            
+            # Normalisation (inchangée)
+            recon = recon / (batch_size * seq_len)
+            kld = kld / (batch_size * seq_len)
+
+            total_recon += recon.item()
+            total_kld += kld.item()
+            n_batches += 1
+
+    return total_recon / n_batches, total_kld / n_batches
+
+def train_model_with_scheduler_and_scheduledsampling(
+    model,
+    train_loader,
+    val_loader,
+    checkpoint_dir="checkpoints",
+    resume=False,
+    epochs=50,
+    batch_size=32,
+    lr=1e-4,
+    kl_anneal_epochs=10,
+    patience=20, 
+    device="cuda"
+):
+    # ... (Initialisations inchangées) ...
+    
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=8
+    )
+
+    history = {
+        "train": [], "val": [], "gen": [], "beta": [], # Ajout de "gen"
+        "train_recon": [], "train_kld": [],
+        "val_recon": [], "val_kld": [],
+        "gen_recon": [], "gen_kld": [],
+        "lr": []
+    }
+
+    start_epoch = 0
+    # On renomme cette variable pour être clair : on cherche la meilleure generation loss
+    best_gen_loss = float("inf") 
+    patience_counter = 0
+
+    # ... (Chargement checkpoint inchangé) ...
+
+    tf_start  = 1.0
+    tf_end = 0.5
+    tf_decay_epochs = 100 
+
+    for epoch in range(start_epoch, epochs):
+        ratio = max(tf_end, tf_start - (tf_start - tf_end) * (epoch / tf_decay_epochs))
+        
+        # --- TRAIN LOOP ---
+        model.train()
+        total_recon, total_kld = 0, 0
+        n_batches = 0
+        beta = min(1.0, epoch / kl_anneal_epochs) if kl_anneal_epochs > 0 else 1.0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} Training"):
+            batch = batch.to(device)              
+            batch = batch.permute(1, 0, 2)        
+            seq_len, batch_size, _ = batch.shape
+
+            optimizer.zero_grad()
+            _, recon, kld = model(batch, teacher_forcing_ratio=ratio)
+
+            recon = recon / (batch_size * seq_len)
+            kld = kld / (batch_size * seq_len)
+            loss = recon + beta * kld
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_recon += recon.item()
+            total_kld += kld.item()
+            n_batches += 1
+
+        train_recon = total_recon / n_batches
+        train_kld = total_kld / n_batches
+        train_loss = train_recon + beta * train_kld
+
+        # --- VALIDATION (DOUBLE CHECK) ---
+        
+        # 1. Validation Reconstruction (Standard) - ratio=1.0
+        # Utile pour vérifier que le modèle n'a pas "oublié" comment compresser
+        val_recon, val_kld = evaluate_scheduled_sampling(model, val_loader, device=device, teacher_forcing_ratio=1.0)
+        val_loss = val_recon + beta * val_kld
+
+        # 2. Validation Génération (Autonome) - ratio=0.0
+        # C'est LE critère important pour vous
+        gen_recon, gen_kld = evaluate_scheduled_sampling(model, val_loader, device=device, teacher_forcing_ratio=0.0)
+        gen_loss = gen_recon + beta * gen_kld
+
+        # --- UPDATE SCHEDULER & LOGS ---
+        
+        # Le scheduler se base sur la capacité à GENERER (la tâche difficile)
+        scheduler.step(gen_loss)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"[{epoch+1}/{epochs}] "
+              f"Train: {train_loss:.3f} | "
+              f"Val (Recon): {val_loss:.3f} | "
+              f"Gen (Auto): {gen_loss:.3f} | "  # On affiche clairement la différence
+              f"LR={current_lr:.2e} | ratio={ratio:.2f}")
+
+        # Update history
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        history["gen"].append(gen_loss) # On sauvegarde aussi la gen loss
+        history["beta"].append(beta)
+        history["train_recon"].append(train_recon)
+        history["train_kld"].append(train_kld)
+        history["val_recon"].append(val_recon)
+        history["val_kld"].append(val_kld)
+        history["gen_recon"].append(gen_recon)
+        history["gen_kld"].append(gen_kld)
+        history["lr"].append(current_lr)
+
+        checkpoint_dict = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "history": history
+        }
+
+        save_checkpoint(checkpoint_dict, checkpoint_dir, "last.pt")
+
+        # --- SAUVEGARDE DU MEILLEUR MODÈLE ---
+        # Modification clé : On compare gen_loss (autonome) et non val_loss
+        if gen_loss < best_gen_loss - 1e-4:
+            best_gen_loss = gen_loss
+            save_checkpoint(checkpoint_dict, checkpoint_dir, "best.pt")
+            patience_counter = 0
+            print(f" → Saved BEST model (Best Gen Loss: {best_gen_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {patience} epochs without improvement on Generation.")
+            break
+
+    # ... (Sauvegarde JSON inchangée) ...
+    print("\nTraining complete.")
+    return history
 
 
 

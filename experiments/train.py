@@ -361,6 +361,173 @@ def train_model(
 
 
 
+def evaluate_scheduled_sampling(model, dataloader, device, teacher_forcing_ratio=1.0):
+    """
+    teacher_forcing_ratio : 
+       - 1.0 (Défaut) = Le modèle reçoit la vraie réponse précédente (Test de Reconstruction).
+       - 0.0 = Le modèle utilise sa propre prédiction précédente (Test de Génération/Autonomie).
+    """
+    model.eval()
+    total_recon, total_kld = 0, 0
+    n_batches = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(device)              # (batch, seq, feat)
+            batch = batch.permute(1, 0, 2)        # → (seq, batch, feat)
+            seq_len, batch_size, _ = batch.shape
+
+            # --- MODIFICATION ICI : On passe le ratio au modèle ---
+            _, recon, kld = model(batch, teacher_forcing_ratio=teacher_forcing_ratio)
+            
+            # Normalisation (inchangée)
+            recon = recon / (batch_size * seq_len)
+            kld = kld / (batch_size * seq_len)
+
+            total_recon += recon.item()
+            total_kld += kld.item()
+            n_batches += 1
+
+    return total_recon / n_batches, total_kld / n_batches
+
+def train_model_with_scheduler_and_scheduledsampling(
+    model,
+    train_loader,
+    val_loader,
+    checkpoint_dir="checkpoints",
+    resume=False,
+    epochs=50,
+    batch_size=32,
+    lr=1e-4,
+    kl_anneal_epochs=10,
+    patience=20, 
+    device="cuda"
+):
+    # ... (Initialisations inchangées) ...
+    
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=8
+    )
+
+    history = {
+        "train": [], "val": [], "gen": [], "beta": [], # Ajout de "gen"
+        "train_recon": [], "train_kld": [],
+        "val_recon": [], "val_kld": [],
+        "gen_recon": [], "gen_kld": [],
+        "lr": []
+    }
+
+    start_epoch = 0
+    # On renomme cette variable pour être clair : on cherche la meilleure generation loss
+    best_gen_loss = float("inf") 
+    patience_counter = 0
+
+    # ... (Chargement checkpoint inchangé) ...
+
+    tf_start  = 1.0
+    tf_end = 0.5
+    tf_decay_epochs = 100 
+
+    for epoch in range(start_epoch, epochs):
+        ratio = max(tf_end, tf_start - (tf_start - tf_end) * (epoch / tf_decay_epochs))
+        
+        # --- TRAIN LOOP ---
+        model.train()
+        total_recon, total_kld = 0, 0
+        n_batches = 0
+        beta = min(1.0, epoch / kl_anneal_epochs) if kl_anneal_epochs > 0 else 1.0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} Training"):
+            batch = batch.to(device)              
+            batch = batch.permute(1, 0, 2)        
+            seq_len, batch_size, _ = batch.shape
+
+            optimizer.zero_grad()
+            _, recon, kld = model(batch, teacher_forcing_ratio=ratio)
+
+            recon = recon / (batch_size * seq_len)
+            kld = kld / (batch_size * seq_len)
+            loss = recon + beta * kld
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_recon += recon.item()
+            total_kld += kld.item()
+            n_batches += 1
+
+        train_recon = total_recon / n_batches
+        train_kld = total_kld / n_batches
+        train_loss = train_recon + beta * train_kld
+
+        # --- VALIDATION (DOUBLE CHECK) ---
+        
+        # 1. Validation Reconstruction (Standard) - ratio=1.0
+        # Utile pour vérifier que le modèle n'a pas "oublié" comment compresser
+        val_recon, val_kld = evaluate_scheduled_sampling(model, val_loader, device=device, teacher_forcing_ratio=1.0)
+        val_loss = val_recon + beta * val_kld
+
+        # 2. Validation Génération (Autonome) - ratio=0.0
+        # C'est LE critère important pour vous
+        gen_recon, gen_kld = evaluate_scheduled_sampling(model, val_loader, device=device, teacher_forcing_ratio=0.0)
+        gen_loss = gen_recon + beta * gen_kld
+
+        # --- UPDATE SCHEDULER & LOGS ---
+        
+        # Le scheduler se base sur la capacité à GENERER (la tâche difficile)
+        scheduler.step(gen_loss)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"[{epoch+1}/{epochs}] "
+              f"Train: {train_loss:.3f} | "
+              f"Val (Recon): {val_loss:.3f} | "
+              f"Gen (Auto): {gen_loss:.3f} | "  # On affiche clairement la différence
+              f"LR={current_lr:.2e} | ratio={ratio:.2f}")
+
+        # Update history
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        history["gen"].append(gen_loss) # On sauvegarde aussi la gen loss
+        history["beta"].append(beta)
+        history["train_recon"].append(train_recon)
+        history["train_kld"].append(train_kld)
+        history["val_recon"].append(val_recon)
+        history["val_kld"].append(val_kld)
+        history["gen_recon"].append(gen_recon)
+        history["gen_kld"].append(gen_kld)
+        history["lr"].append(current_lr)
+
+        checkpoint_dict = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "history": history
+        }
+
+        save_checkpoint(checkpoint_dict, checkpoint_dir, "last.pt")
+
+        # --- SAUVEGARDE DU MEILLEUR MODÈLE ---
+        # Modification clé : On compare gen_loss (autonome) et non val_loss
+        if gen_loss < best_gen_loss - 1e-4:
+            best_gen_loss = gen_loss
+            save_checkpoint(checkpoint_dict, checkpoint_dir, "best.pt")
+            patience_counter = 0
+            print(f" → Saved BEST model (Best Gen Loss: {best_gen_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {patience} epochs without improvement on Generation.")
+            break
+
+    # ... (Sauvegarde JSON inchangée) ...
+    print("\nTraining complete.")
+    return history
 
 
 
