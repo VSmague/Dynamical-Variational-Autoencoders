@@ -21,10 +21,7 @@ We conducted our experiments on a subset of the VCTK corpus, a speech dataset co
 The primary goals of this implementation were to:
 
 * **Re-implement Architectures:** Build the VRNN and SRNN architectures from scratch using PyTorch.
-* **Hyperparameter Optimization:** Train models by selecting optimal parameters, with a specific focus on:
-* Choice of prior distribution (Gaussian vs. Student-t).
-* Duration of the Kullback-Leibler (KL) divergence annealing phase.
-* Number of epochs and learning rate scheduling.
+* **Hyperparameter Optimization:** Train models by selecting optimal parameters, with a specific focus on choice of prior distribution (Gaussian vs. Student-t), duration of the Kullback-Leibler (KL) divergence annealing phase, number of epochs and learning rate scheduling, ... 
 
 
 * **Reconstruction Evaluation:** Assess the quality of audio reconstruction across the different architectures and priors.
