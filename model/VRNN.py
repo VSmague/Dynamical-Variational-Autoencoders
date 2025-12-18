@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import torch.distributions as dist
 
 def get_activation(name):
     if name is None:
@@ -368,6 +368,243 @@ class VRNN(nn.Module):
                 generated_frames.append(dec_mu)
                 
                 # Auto-régressif
+                x_t = dec_mu 
+                
+                rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+                _, h = self.rnn(rnn_input, h)
+        
+        return torch.stack(generated_frames).squeeze(1)
+
+
+
+
+
+class VRNN_Student(nn.Module):
+    def __init__(self, x_dim=80, h_dim=256, z_dim=32, phi_x_dim=32, phi_z_dim=16, df=3.0):
+        super().__init__()
+        self.x_dim = x_dim
+        self.h_dim = h_dim
+        self.z_dim = z_dim
+        self.df = df # Degrés de liberté fixés (paramètre de lourdeur des queues)
+
+        # Features extractors phi
+        self.phi_x = MLP(
+            input_dim=x_dim,
+            n_list=[256, phi_x_dim],
+            f_list=["tanh", "linear"]
+        )
+
+        self.phi_z = MLP(
+            input_dim=z_dim,
+            n_list=[32, 64, phi_z_dim],
+            f_list=["tanh", "tanh", "linear"]
+        )
+
+        # Encoder q(z|x,h) -> On garde une Gaussienne pour l'encodeur (stabilité)
+        self.enc = MLP(
+            input_dim=phi_x_dim + h_dim,
+            n_list=[256],
+            f_list=["tanh"]
+            )
+        self.enc_mu = nn.Linear(256, z_dim)
+        self.enc_logvar = nn.Linear(256, z_dim)
+
+        # Prior p(z|h) -> Paramètres de la Student (Location, Scale)
+        # On ne prédit pas df pour éviter l'instabilité, on utilise self.df fixe
+        self.prior = MLP(
+            input_dim=h_dim,
+            n_list=[256],
+            f_list=["tanh"]
+        )
+        self.prior_mu = nn.Linear(256, z_dim)
+        self.prior_logvar = nn.Linear(256, z_dim)
+
+        # Decoder p(x|z,h)
+        self.dec = MLP(
+            input_dim=phi_z_dim + h_dim,
+            n_list=[256],
+            f_list=["tanh"]
+        )
+        self.dec_mu = nn.Linear(256, x_dim)
+        self.dec_logvar = nn.Linear(256, x_dim)
+
+        # RNN
+        self.rnn = nn.GRU(phi_x_dim + phi_z_dim, h_dim)
+
+    def _compute_kl_student(self, enc_mu, enc_logvar, prior_mu, prior_logvar):
+        """
+        Calcule la KL( Gaussian || Student-t ) via Monte Carlo.
+        KL = E_q [ log q(z|x) - log p(z) ]
+        """
+        # 1. Distribution Postérieure q(z|x) (Gaussienne)
+        q_std = torch.exp(0.5 * enc_logvar)
+        q_z = dist.Normal(enc_mu, q_std)
+
+        # 2. Distribution Prior p(z|h) (Student-t)
+        p_scale = torch.exp(0.5 * prior_logvar)
+        # StudentT attend (df, loc, scale). Assure que df est sur le bon device si besoin.
+        p_z = dist.StudentT(df=self.df, loc=prior_mu, scale=p_scale)
+
+        # 3. Échantillonner z pour l'approximation
+        # rsample() garde le gradient (reparameterization trick)
+        z = q_z.rsample() 
+
+        # 4. Calcul de la différence des log-probs
+        kl = q_z.log_prob(z) - p_z.log_prob(z)
+        
+        # Somme sur les dimensions latentes (z_dim)
+        return torch.sum(kl, dim=1) 
+
+    def forward(self, x, teacher_forcing_ratio=1.0):
+        seq_len, batch, _ = x.size()
+        h = torch.zeros(1, batch, self.h_dim, device=x.device)
+
+        kld_loss = 0
+        recon_loss = 0
+        
+        all_recon = []
+        prev_x = x[0] 
+
+        for t in range(seq_len):
+            # --- SELECTION DE L'ENTRÉE ---
+            if t == 0:
+                x_t_input = x[t]
+            else:
+                if torch.rand(1).item() < teacher_forcing_ratio:
+                    x_t_input = x[t]      
+                else:
+                    x_t_input = prev_x    
+
+            phi_x_t = self.phi_x(x_t_input)
+
+            # Prior p(z|h)
+            prior_h = self.prior(h.squeeze(0))
+            prior_mu = self.prior_mu(prior_h)
+            prior_logvar = self.prior_logvar(prior_h)
+
+            # Encoder q(z|x,h)
+            enc_h = self.enc(torch.cat([phi_x_t, h.squeeze(0)], dim=1)) 
+            enc_mu = self.enc_mu(enc_h)
+            enc_logvar = self.enc_logvar(enc_h)
+
+            # Sampling z (Gaussien pour le training car vient de l'encodeur)
+            # C'est important: l'encodeur est q(z|x), on sample q pour calculer la loss
+            std = torch.exp(0.5 * enc_logvar)
+            eps = torch.randn_like(std)
+            z_t = enc_mu + eps * std
+            
+            phi_z_t = self.phi_z(z_t)
+
+            # Decoder
+            dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
+            dec_mu = self.dec_mu(dec_h)
+            dec_logvar = self.dec_logvar(dec_h)
+            
+            all_recon.append(dec_mu)
+            prev_x = dec_mu 
+
+            # Loss Reconstruction
+            recon_loss += 0.5 * torch.sum(
+                dec_logvar
+                + (x[t] - dec_mu)**2 / torch.exp(dec_logvar)
+            )
+
+            # Loss KL (Monte Carlo Student)
+            kl_t = self._compute_kl_student(enc_mu, enc_logvar, prior_mu, prior_logvar)
+            kld_loss += torch.sum(kl_t) # Somme sur le batch
+
+            # Update RNN
+            rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+            _, h = self.rnn(rnn_input, h)
+
+        x_recon = torch.stack(all_recon)
+        return x_recon, recon_loss, kld_loss
+
+
+    def generate(self, seq_len=200, device='cuda'):
+        self.eval() 
+        h = torch.zeros(1, 1, self.h_dim, device=device)
+        x_t = torch.zeros(1, self.x_dim, device=device)
+        generated_frames = []
+        
+        with torch.no_grad():
+            for t in range(seq_len):
+                phi_x_t = self.phi_x(x_t)
+                
+                prior_h = self.prior(h.squeeze(0))
+                prior_mu = self.prior_mu(prior_h)
+                prior_logvar = self.prior_logvar(prior_h)
+                
+                # --- SAMPLING STUDENT ---
+                p_scale = torch.exp(0.5 * prior_logvar)
+                
+                # On crée la distribution Student
+                z_dist = dist.StudentT(df=self.df, loc=prior_mu, scale=p_scale)
+                z_t = z_dist.sample() # Sample direct
+                
+                phi_z_t = self.phi_z(z_t)
+                
+                # Decoder
+                dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
+                dec_mu = self.dec_mu(dec_h)
+                
+                generated_frames.append(dec_mu)
+                x_t = dec_mu 
+                
+                rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+                _, h = self.rnn(rnn_input, h)
+        
+        return torch.stack(generated_frames).squeeze(1)
+
+    def generate_with_priming(self, seq_len=200, prime_sequence=None, device='cuda', noise_level=0.8):
+        # Code quasi identique à VRNN normal, sauf pour le sampling z_t en phase 2
+        self.eval()
+        h = torch.zeros(1, 1, self.h_dim, device=device)
+        
+        if prime_sequence is not None:
+            x_t = prime_sequence[0].unsqueeze(0)
+        else:
+            x_t = torch.zeros(1, self.x_dim, device=device)
+            
+        generated_frames = []
+        
+        with torch.no_grad():
+            if prime_sequence is not None:
+                prime_len = prime_sequence.size(0)
+                for t in range(prime_len - 1):
+                    x_t_real = prime_sequence[t].unsqueeze(0)
+                    phi_x_t = self.phi_x(x_t_real)
+                    
+                    prior_h = self.prior(h.squeeze(0))
+                    enc_h = self.enc(torch.cat([phi_x_t, h.squeeze(0)], dim=1))
+                    enc_mu = self.enc_mu(enc_h)
+                    z_t = enc_mu 
+                    
+                    phi_z_t = self.phi_z(z_t)
+                    rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
+                    _, h = self.rnn(rnn_input, h)
+                    
+                x_t = prime_sequence[-1].unsqueeze(0)
+
+            for t in range(seq_len):
+                phi_x_t = self.phi_x(x_t)
+                
+                prior_h = self.prior(h.squeeze(0))
+                prior_mu = self.prior_mu(prior_h)
+                prior_logvar = self.prior_logvar(prior_h)
+                
+                p_scale = torch.exp(0.5 * prior_logvar)
+                
+                # Astuce pour noise_level avec Student : réduire le scale
+                z_dist = dist.StudentT(df=self.df, loc=prior_mu, scale=p_scale * noise_level)
+                z_t = z_dist.sample()
+                
+                phi_z_t = self.phi_z(z_t)
+                
+                dec_h = self.dec(torch.cat([phi_z_t, h.squeeze(0)], dim=1))
+                dec_mu = self.dec_mu(dec_h)
+                
+                generated_frames.append(dec_mu)
                 x_t = dec_mu 
                 
                 rnn_input = torch.cat([phi_x_t, phi_z_t], dim=1).unsqueeze(0)
