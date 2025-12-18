@@ -10,7 +10,9 @@ We replicate and experiment with two specific architectures presented in the pap
 2. SRNN (Stochastic Recurrent Neural Network): A hierarchical architecture designed to better separate deterministic and stochastic information.
 
 ## Results
-The comprehensive results of our experiments are available in the [Experiments with VRNN.ipynb] notebook within the "experiments" folder.
+- The code of our experiments is available in the Experiments with VRNN.ipynb notebook, within the "experiments" folder.
+- Our experiments are presented in the file "Poster (one page presentation of the project)".
+- A comprehensive report of the project is also available under the name "Report DVAE project".
 
 ## Dataset
 
